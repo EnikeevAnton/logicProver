@@ -9,6 +9,11 @@ AXIOMS = {
     'A3': "((~B)->(~A))->(((~B)->A)->B)"
 }
 
+class Colors:
+    OKGREEN = '\033[92m'  # Зеленый цвет для выделения
+    ENDC = '\033[0m'     # Сброс цвета (обязателен)
+    BOLD = '\033[1m'
+
 # --- 1. Классы данных ---
 
 class Formula:
@@ -39,6 +44,7 @@ class Formula:
         if self.kind == 'var': return hash(('var', self.name))
         if self.kind == 'not': return hash(('not', self.left))
         return hash(('imp', self.left, self.right))
+    
 
 class Parser:
     pattern = re.compile(r'\s*(->|~|\(|\)|[A-Za-z0-9_]+)')
@@ -104,23 +110,28 @@ class Proof:
     
     def add_line(self, f, text):
         self.lines.append((f, text))
-    
-    def extend(self, other):
-        self.lines.extend(other.lines)
-            
+
     def __str__(self):
         if not self.lines: return "Empty"
         
-        # Запускаем фикс индексов перед печатью
         self.fix_mp_indices()
-        
         max_len = max(len(str(line[0])) for line in self.lines)
         col_w = max_len + 4
         res = ""
+        
         for i, (f, text) in enumerate(self.lines):
-            res += f"{str(i).ljust(4)}{str(f).ljust(col_w)}[{text}]\n"
+            formula_str = str(f)
+            rule_text = text.strip().lower()
+            is_highlighted = ("дедукция" in rule_text) or ("<--" in rule_text)
+            formatted_formula = formula_str
+            if is_highlighted:
+                formatted_rule = f"{Colors.BOLD}{Colors.OKGREEN}[{Colors.ENDC}{Colors.BOLD}{text}{Colors.BOLD}{Colors.OKGREEN}]{Colors.ENDC}"
+            else:
+                formatted_rule = f"[{text}]"
+            padding = " " * (col_w - len(formula_str))
+            res += f"{str(i).ljust(4)}{formatted_formula}{padding}{formatted_rule}\n"
+            
         return res
-
     def fix_mp_indices(self):
         """
         Проходит по доказательству и проставляет реальные индексы для MP.
@@ -154,6 +165,29 @@ class Proof:
                     # Обновляем текст строки
                     new_text = f"{text} из {found_premise} и {found_imp}"
                     self.lines[i] = (formula, new_text)
+    
+    def get_line_number(self, f):
+        """Возвращает индекс первой найденной формулы f."""
+        for i, (formula, _) in enumerate(self.lines):
+            if formula == f:
+                return i
+        return None
+    
+    def get_formulas(self):
+        """Возвращает набор всех формул, присутствующих в доказательстве."""
+        return {f for f, text in self.lines}
+
+    def extend(self, other):
+        existing_formulas = self.get_formulas()
+        
+        for f, text in other.lines:
+            is_hypothesis = "Гипотеза" in text and text.strip() == "Гипотеза"
+            if is_hypothesis and f in existing_formulas:
+                continue
+
+            self.lines.append((f, text))
+            existing_formulas.add(f)
+
 
 # --- 3. Логика Доказательства ---
 
@@ -167,7 +201,7 @@ def transform_deduction(subproof, A, axioms):
         else:
             new_text = f"|  {text}"
         new_proof.add_line(f, new_text)
-        
+    
     if subproof.lines:
         B = subproof.lines[-1][0]
         new_proof.add_line(Formula('imp', A, B), f"Дедукция ({A} -> ...)")
@@ -229,68 +263,184 @@ def prepare_pool(goal, assumptions=None):
             stack.append(f.left); stack.append(f.right)
     return list(pool)
 
+
+def dne_template(A_var, B_var):
+    if A_var.kind == 'not':
+        if A_var.left.kind == 'not' and A_var.left.left == B_var:
+            return True
+    return False
+
+def get_claus(A_var, neg_A_var):
+    left_part = Formula('imp', neg_A_var, A_var)
+    return Formula('imp', left_part, A_var)
+
+
 # --- ОСНОВНОЙ РЕКУРСИВНЫЙ ПОИСК ---
 
 def prove_recursive(goal, axioms, static_pool, assumptions=None, depth=0, max_depth=10):
     if assumptions is None: assumptions = set()
-    
-    # Тождество
-    if goal.kind == 'imp' and goal.left == goal.right:
-        p = Proof(axioms)
-        A = goal.left
-        # A -> ((A->A)->A)
-        p.add_line(Formula('imp', A, Formula('imp', goal, A)), "Инстанция A1")
-        # A2
-        term2 = Formula('imp', Formula('imp', A, goal), goal)
-        p.add_line(Formula('imp', p.lines[0][0], term2), "Инстанция A2")
-        # MP
-        p.add_line(term2, "MP")
-        # A -> (A->A)
-        p.add_line(Formula('imp', A, goal), "Инстанция A1")
-        # Final
-        p.add_line(goal, "MP")
-        return p
 
     proof = Proof(axioms)
 
     if goal in assumptions:
-        proof.add_line(goal, "Гипотеза")
+        if proof.get_line_number(goal) is None:
+            proof.add_line(goal, "Гипотеза")
         return proof
     
     for name, ax in axioms.items():
         if ax.match(goal):
             proof.add_line(goal, f"Инстанция {name}")
             return proof
-            
+    
+    if goal.kind == 'imp':
+        if dne_template(goal.left, goal.right) or dne_template(goal.right, goal.left):
+            proof.add_line(goal, "Двойное отрицание") # берем за лемму
+            return proof
+        
     if depth > max_depth: return None
 
-    for H in assumptions:
+    # Если есть противоречие сразу получаем из него цель solve_contradiction()
+    ordered_assumptions = sorted(list(assumptions), key=lambda f: str(f))
+    for H in ordered_assumptions:
         neg_H = Formula('not', H)
         if neg_H in assumptions:
             proof.add_line(H, "Гипотеза")
             proof.add_line(neg_H, "Гипотеза")
             return solve_contradiction(proof, goal, H, 1, 0)
 
-    # Дедукция
+    # Дедукция (A -> ...)
     if goal.kind == 'imp':
         A, B = goal.left, goal.right
         sub = prove_recursive(B, axioms, static_pool, assumptions | {A}, depth+1, max_depth)
         if sub: return transform_deduction(sub, A, axioms)
 
-
-    imps = [f for f in assumptions if f.kind == 'imp']
+    # MP среди гипотез для вывода новых 
+    imps = [f for f in ordered_assumptions if f.kind == 'imp']
     for imp in imps:
         X, Y = imp.left, imp.right
+        if Y == goal and X in assumptions:
+            if proof.get_line_number(imp) is None:
+                proof.add_line(imp, "Гипотеза")
+                idx_imp = len(proof.lines) - 1
+
+            if proof.get_line_number(X) is None:
+                proof.add_line(X, "Гипотеза")
+                idx_X = len(proof.lines) - 1
+
+            proof.add_line(goal, f"MP")
+            return proof
         if X in assumptions and Y not in assumptions:
             if Y in static_pool:
                 res = prove_recursive(goal, axioms, static_pool, assumptions | {Y}, depth+1, max_depth)
                 if res:
-                    proof.add_line(imp, "Гипотеза")
-                    proof.add_line(X, "Гипотеза")
-                    proof.add_line(Y, "MP")
+                    if proof.get_line_number(imp) is None:
+                        proof.add_line(imp, "Гипотеза")
+                    if proof.get_line_number(X) is None:
+                        proof.add_line(X, "Гипотеза")
+                    if proof.get_line_number(Y) is None:
+                        proof.add_line(Y, "MP")
                     proof.extend(res)
                     return proof
+    
+    # Гипотеза P -> G и цель G
+    P_imp_Goal = None
+    P_val = None
 
+    # Поиск в гипотезах P -> G, попытка доказать ~P -> G. Вывод (P -> G) : (~G -> ~P) и (~P -> G) : (~G -> P)
+    # При получении (~G -> ~P) и (~G -> P) -  инстанция A3 (~G -> ~P) -> ((~G -> P) -> G)
+    # Далее два раза применяется MP и выводится G (цель)
+    for f in ordered_assumptions:
+        if f.kind == 'imp' and f.right == goal:
+            P_imp_Goal = f
+            P_val = f.left
+            break
+            
+    if P_imp_Goal and goal.kind == 'var':
+
+        # Определяем вторую необходимую импликацию: ~P -> G
+        not_P_val = Formula('not', P_val)
+        notP_imp_Goal = Formula('imp', not_P_val, goal)
+        
+        current_assumptions = set(assumptions)
+
+        # Если ~P -> G еще не в гипотезах, пытаемся его доказать
+        if notP_imp_Goal not in current_assumptions:
+            
+            # Доказываем ~P -> G
+            subproof_res = prove_recursive(notP_imp_Goal, axioms, static_pool, current_assumptions, depth + 1, max_depth)
+            
+            if not subproof_res:
+                # Не смогли доказать ключевую импликацию, стратегия не сработала
+                return None
+            
+            # Добавляем доказательство ~P -> G в основное доказательство
+            proof.extend(subproof_res)
+            current_assumptions.add(notP_imp_Goal)
+        
+        # Теперь у нас есть: P -> G (из гипотез) и ~P -> G (доказано/было в гипотезах)
+
+        neg_Goal = Formula('not', goal)
+        G1 = Formula('imp', neg_Goal, not_P_val)
+        G2 = Formula('imp', neg_Goal, P_val)
+        
+        can_proceed = True
+        current_assumptions = {P_imp_Goal}
+        # P -> G |- ~G -> ~P
+        if G1 not in current_assumptions:
+            proof_G1 = prove_recursive(G1, axioms, static_pool, current_assumptions, depth + 1, max_depth)
+            if proof_G1:
+                proof.extend(proof_G1)
+                current_assumptions.add(G1)
+            else:
+                can_proceed = False
+        
+        # ~P -> G |- ~G -> P
+        current_assumptions = {notP_imp_Goal}
+        if G2 not in current_assumptions and can_proceed:
+            proof_G2 = prove_recursive(G2, axioms, static_pool, current_assumptions, depth + 1, max_depth)
+            
+            if proof_G2:
+                proof.extend(proof_G2)
+                current_assumptions.add(G2)
+            else:
+                 can_proceed = False
+        
+        if not can_proceed:
+            return None # Не удалось доказать
+
+        # A3: Из G1 (~G -> ~P) и G2 (~G -> P) выводим Goal (G)
+        
+        # A3 инстанция: (~G -> ~P) -> ((~G -> P) -> G)
+        ax3_instance = Formula('imp', G1, Formula('imp', G2, goal))
+        proof.add_line(ax3_instance, "Инстанция A3")
+        
+        # MP из G1 и A3
+        s_step = ax3_instance.right
+        proof.add_line(s_step, "MP")
+        
+        # MP из G2 (Финальный Goal)
+        proof.add_line(goal, "MP")
+        
+        return proof
+
+    # Статегия вывода противоречия: пусть в гипотезах ~P, попытаемся док-ть P
+    for H in ordered_assumptions:
+        if H.kind == 'not':
+            target_conflict = H.left
+            if target_conflict != goal and target_conflict not in assumptions:
+                conflict_proof = prove_recursive(target_conflict, axioms, static_pool, assumptions, depth + 1, max_depth)
+                
+                if conflict_proof:
+                    proof.extend(conflict_proof)
+                    if proof.get_line_number(H) is None:
+                        proof.add_line(H, "Гипотеза")
+                    idx_X = len(proof.lines) - 2
+                    idx_not_X = len(proof.lines) - 1
+                    
+                    # доказательство успеншо: выводим цель
+                    return solve_contradiction(proof, goal, target_conflict, idx_not_X, idx_X)
+    
+    # Доказательсво от противного: цель G, докажем ~G->G. Далее (~G->G)->G (A3)
     if depth < max_depth - 1:
         if goal.kind == 'not': neg_goal = goal.left
         else: neg_goal = Formula('not', goal)
@@ -303,20 +453,22 @@ def prove_recursive(goal, axioms, static_pool, assumptions=None, depth=0, max_de
             res = prove_recursive(goal, axioms, static_pool, assumptions | facts, depth+1, max_depth)
             if res:
                 deduction = transform_deduction(res, neg_goal, axioms)
-                deduction.add_line(goal, "Докажем от противного")
+                deduction.add_line(goal, f'<--Текущая цель, пусть {neg_goal}')
+                deduction.add_line(get_claus(goal, neg_goal), "Инстанция A3")
+                deduction.add_line(goal, "MP")
                 return deduction
 
     return None
 
 PRESETS = {
-    '1': ('A4 A∧B→A', "~(A->~B)->(A->(B->A))"),
-    '2': ('A5 A∧B→B', "~(A->~B)->(B->(A->B))"),
-    '3': ('A6 A→(B→(A∧B))', "A->(B->~(A->~B))"),
-    '4': ('A7 A→(A∨B)', "A->((~A)->B)->(A->((~A)->B))"),
-    '5': ('A8  B→(A∨B)', "B->((~B)->A)->(B->((~B)->A))"),
-    '6': ('A9 (A→C)→((B→C)→((A∨B)→C))', "(A->C)->((B->C)->((~A)->B->C))"),
-    '7': ('A10 ¬A→(A→B)', "~A->(A->B)"),
-    '8': ('A11 A∨¬A', "(A->A)->( (~A)->(A->A) )")
+    '1': ('A4 A∧B→A', "(~(A->~B)) -> A"),
+    '2': ('A5 A∧B→B', "(~(A->~B)) -> B"),
+    '3': ('A6 A→(B→(A∧B))', "A -> (B -> ~(A->~B))"),
+    '4': ('A7 A→(A∨B)', "A -> (~A -> B)"),
+    '5': ('A8  B→(A∨B)', "B -> (~A -> B)"),
+    '6': ('A9 (A→C)→((B→C)→((A∨B)→C))', "(A->C) -> ((B->C) -> ((~A->B) -> C))"),
+    '7': ('A10 ¬A→(A→B)', "~A -> (A -> B)"),
+    '8': ('A11 A∨¬A', "~A -> ~A")
 }
 # --- ЗАПУСК ---
 def main():
